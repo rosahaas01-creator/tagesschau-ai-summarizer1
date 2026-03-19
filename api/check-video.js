@@ -2,9 +2,9 @@ import { kv } from '@vercel/kv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { GoogleAIFileManager } from '@google/generative-ai/server';
 import { Resend } from 'resend';
-import ytdl from '@distube/ytdl-core';
 import fs from 'fs';
 import { pipeline } from 'stream/promises';
+import { Readable } from 'stream';
 import os from 'os';
 import path from 'path';
 
@@ -19,83 +19,99 @@ export default async function handler(req, res) {
     }
 
     try {
-        console.log("Starte Überprüfung auf neues Tagesschau-Video...");
+        console.log("Starte Überprüfung auf neue Tagesschau-Sendung auf tagesschau.de...");
         
-        // Check API Keys
-        if (!process.env.GEMINI_API_KEY || !process.env.YOUTUBE_API_KEY) {
-            throw new Error("API Keys fehlen in den Environment Variables.");
+        if (!process.env.GEMINI_API_KEY) {
+            throw new Error("GEMINI_API_KEY fehlt.");
         }
 
-        // 1. YouTube Playlist abrufen
-        const PLAYLIST_ID = 'PL4A2F331EE86DCC22';
-        const ytUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${PLAYLIST_ID}&maxResults=3&key=${process.env.YOUTUBE_API_KEY}`;
+        // 1. Neueste Sendungs-URL finden
+        const indexUrl = "https://www.tagesschau.de/multimedia/sendung/tagesschau_20_uhr/";
+        const indexRes = await fetch(indexUrl);
+        const indexHtml = await indexRes.text();
         
-        const ytRes = await fetch(ytUrl);
-        if (!ytRes.ok) {
-            const errorText = await ytRes.text();
-            throw new Error(`YouTube API Fehler (${ytRes.status}): ${errorText}`);
+        // Suche nach Links vom Typ /tagesschau_20_uhr/video-1565932.html
+        const videoLinkMatch = indexHtml.match(/\/tagesschau_20_uhr\/video-([0-9]+)\.html/);
+        if (!videoLinkMatch) {
+            throw new Error("Konnte keinen Link zur aktuellen 20-Uhr-Sendung finden.");
         }
         
-        const ytData = await ytRes.json();
-        
-        if (!ytData.items || ytData.items.length === 0) {
-            return res.status(200).json({ message: 'Keine Videos in der Playlist gefunden.' });
-        }
-        
-        const latestVideo = ytData.items[0];
-        const videoId = latestVideo.snippet.resourceId.videoId;
-        const videoTitle = latestVideo.snippet.title;
-        const videoDate = latestVideo.snippet.publishedAt;
-        
-        console.log(`Neuestes Video: ${videoTitle} (${videoId})`);
-        
+        const videoId = videoLinkMatch[1];
+        const videoUrl = `https://www.tagesschau.de${videoLinkMatch[0]}`;
+        console.log(`Neueste Sendung gefunden: ${videoUrl} (ID: ${videoId})`);
+
         // 2. Prüfen, ob Video bereits verarbeitet wurde
         const alreadyProcessed = await kv.sismember('processed_videos', videoId);
         if (alreadyProcessed) {
-            return res.status(200).json({ message: 'Video wurde bereits verarbeitet.', videoId });
+            return res.status(200).json({ message: 'Sendung wurde bereits verarbeitet.', videoId });
+        }
+
+        // 3. MP4 URL aus der Video-Seite extrahieren
+        console.log("Extrahiere MP4-Link...");
+        const videoPageRes = await fetch(videoUrl);
+        const videoPageHtml = await videoPageRes.text();
+        
+        // Die Video-Links liegen oft in einem JSON Block namens mediaCollection
+        const mediaCollectionMatch = videoPageHtml.match(/mediaCollection\s*:\s*(\{.*?\})\s*,/s) || 
+                                     videoPageHtml.match(/var\s+mediaCollection\s*=\s*(\{.*?\});/s);
+        
+        if (!mediaCollectionMatch) {
+            throw new Error("Konnte mediaCollection im Quelltext nicht finden.");
         }
         
-        // 3. Video via ytdl-core in /tmp herunterladen
-        console.log("Lade Video herunter...");
+        const mediaCollection = JSON.parse(mediaCollectionMatch[1]);
+        const streams = mediaCollection._mediaArray[0]._mediaStreamArray;
+        
+        // Finde den besten MP4 Stream (meistens am Ende oder nach Qualität sortiert)
+        const mp4Stream = streams.filter(s => s._stream && s._stream.endsWith('.mp4'))
+                                 .sort((a, b) => (b._quality || 0) - (a._quality || 0))[0];
+        
+        if (!mp4Stream || !mp4Stream._stream) {
+            throw new Error("Keine MP4-Stream URL gefunden.");
+        }
+        
+        const directMp4Url = mp4Stream._stream;
+        console.log(`Direkter MP4-Link extrahiert: ${directMp4Url}`);
+
+        // 4. Video herunterladen
+        console.log("Lade Video von tagesschau.de herunter...");
         const tmpPath = path.join(os.tmpdir(), `${videoId}.mp4`);
-        const videoStream = ytdl(`https://www.youtube.com/watch?v=${videoId}`, { 
-            filter: 'audioandvideo',
-            quality: 'lowest' 
-        });
+        const mp4Res = await fetch(directMp4Url);
+        if (!mp4Res.ok) throw new Error("Download der MP4 fehlgeschlagen.");
         
-        await pipeline(videoStream, fs.createWriteStream(tmpPath));
-        console.log("Video lokal in vercel temporärem Verzeichnis gespeichert.");
-        
-        // 4. Video an Gemini File API hochladen
+        const fileStream = fs.createWriteStream(tmpPath);
+        await pipeline(Readable.fromWeb(mp4Res.body), fileStream);
+        console.log("Video erfolgreich in /tmp gespeichert.");
+
+        // 5. Video an Gemini File API hochladen
         console.log("Lade Video zu Gemini hoch...");
         const uploadResult = await fileManager.uploadFile(tmpPath, {
            mimeType: 'video/mp4',
-           displayName: videoTitle
+           displayName: `Tagesschau 20 Uhr ${videoId}`
         });
         
-        console.log(`Video hochgeladen: ${uploadResult.file.uri}`);
+        console.log(`Video bei Gemini hochgeladen: ${uploadResult.file.uri}`);
 
         // Warte auf Processing
         let file = await fileManager.getFile(uploadResult.file.name);
         while (file.state === 'PROCESSING') {
-            process.stdout.write(".");
-            await new Promise((resolve) => setTimeout(resolve, 10_000));
+            await new Promise((resolve) => setTimeout(resolve, 5000));
             file = await fileManager.getFile(uploadResult.file.name);
         }
 
         if (file.state === 'FAILED') {
-            throw new Error("Video processing failed.");
+            throw new Error("Gemini Video-Processing fehlgeschlagen.");
         }
-        
-        // 5. Inhalte via Gemini generieren
-        console.log("Analysiere Video mit gemini-1.5-flash...");
+
+        // 6. Analyse generieren
+        console.log("Starte Gemini Analyse...");
         const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const prompt = `Du bist ein professioneller Nachrichten-Analyst. 
-Analysiere diese Ausgabe der "Tagesschau 20 Uhr".
-Erstelle mir eine Ausgabe im JSON Format mit folgendem Schema:
+        const prompt = `Analysiere diese Ausgabe der "Tagesschau 20 Uhr". 
+Erstelle eine strukturierte Zusammenfassung und eine visuelle Beschreibung.
+Antworte ausschließlich im JSON Format:
 {
-  "summary": "Detaillierte, inhaltliche Zusammenfassung der wichtigsten Themen der Sendung.",
-  "visuals": "Detaillierte visuelle Beschreibung (Szenen, Grafiken im Hintergrund, Auffälligkeiten im Studio)."
+  "summary": "Inhaltliche Zusammenfassung...",
+  "visuals": "Visuelle Details..."
 }`;
 
         const result = await model.generateContent([
@@ -109,49 +125,42 @@ Erstelle mir eine Ausgabe im JSON Format mit folgendem Schema:
         ]);
         
         const responseText = result.response.text();
-        // Bereinige den Text von Markdown-Code-Blöcken falls vorhanden
         const cleanedJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
         const jsonResponse = JSON.parse(cleanedJson);
-        
-        // 6. In Vercel KV Datenbank speichern
+
+        // 7. Speichern in KV
         console.log("Speichere in Datenbank...");
+        const videoTitle = `Tagesschau 20 Uhr (${videoId})`;
         const dbEntry = {
             id: videoId,
             title: videoTitle,
-            date: videoDate,
+            date: new Date().toISOString(),
             summary: jsonResponse.summary,
             visuals: jsonResponse.visuals,
             processedAt: new Date().toISOString()
         };
         
-        // Speichere das einzelne Video als Hash und füge die ID der Feed-Liste hinzu
         await kv.hset(`video:${videoId}`, dbEntry);
         await kv.lpush('feed', dbEntry);
         await kv.sadd('processed_videos', videoId);
-        
-        // 7. E-Mail Senden
-        console.log("Sende E-Mail via Resend...");
-        const emailTo = process.env.USER_EMAIL && process.env.USER_EMAIL !== "" 
-                        ? process.env.USER_EMAIL 
-                        : "onboarding@resend.dev";
-                        
+
+        // 8. E-Mail senden
+        console.log("Sende E-Mail...");
         await resend.emails.send({
             from: process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev',
-            to: emailTo,
-            subject: `Tagesschau Zusammenfassung: ${videoTitle}`,
-            html: `<h2>Zusammenfassung</h2><p>${jsonResponse.summary.replace(/\n/g, '<br>')}</p><h2>Visuelle Details</h2><p>${jsonResponse.visuals.replace(/\n/g, '<br>')}</p>`
+            to: process.env.USER_EMAIL || 'onboarding@resend.dev',
+            subject: `Tagesschau Zusammenfassung: ${videoId}`,
+            html: `<h2>Zusammenfassung</h2><p>${jsonResponse.summary}</p><h2>Visuelle Details</h2><p>${jsonResponse.visuals}</p>`
         });
-        
-        // 8. Aufräumen (Lokale Datei löschen, Vercel löscht /tmp eh irgendwann, aber sicher ist sicher)
+
+        // 9. Aufräumen
         if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-        // Hinweis: Die Datei bei Google AI Studio bleibt dort, falls man sie später braucht, 
-        // oder man könnte sie mit fileManager.deleteFile(file.name) löschen.
         
         console.log("Erfolgreich abgeschlossen!");
-        return res.status(200).json({ success: true, dbEntry });
-        
+        return res.status(200).json({ success: true, videoId });
+
     } catch (error) {
-        console.error("Fehler bei der Video-Analyse:", error);
+        console.error("KRITISCHER FEHLER:", error);
         return res.status(500).json({ error: 'Internal Server Error', details: String(error) });
     }
 }
