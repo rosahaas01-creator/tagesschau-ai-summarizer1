@@ -8,7 +8,6 @@ import { Readable } from 'stream';
 import os from 'os';
 import path from 'path';
 
-// Initialisiere die APIs
 const resend = new Resend(process.env.RESEND_API_KEY);
 const ai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
@@ -21,29 +20,21 @@ export default async function handler(req, res) {
     try {
         console.log("Starte Überprüfung auf 'Tagesschau in 100 Sekunden'...");
         
-        if (!process.env.GEMINI_API_KEY) {
-            throw new Error("GEMINI_API_KEY fehlt.");
-        }
-
-        // 1. Neueste MP4-URL aus dem 100-Sekunden RSS-Feed extrahieren
-        const rssUrl = "https://www.tagesschau.de/multimedia/sendung/tagesschau_in_100_sekunden/podcast-ts100-video-100.xml";
-        const rssRes = await fetch(rssUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        const rssText = await rssRes.text();
+        // 1. Suche nach der neuesten Folge auf der Webseite
+        const baseUrl = "https://www.tagesschau.de/multimedia/sendung/tagesschau_in_100_sekunden/";
+        const indexRes = await fetch(baseUrl);
+        const indexHtml = await indexRes.text();
         
-        // Suche nach der ersten Enclosure mit .mp4 (das ist die aktuellste Folge)
-        const enclosureMatch = rssText.match(/<enclosure url="([^"]+\.mp4)"/i);
-        if (!enclosureMatch) {
-            throw new Error("Konnte keine MP4-Datei im Podcast-Feed finden.");
+        // Suche nach Links wie /tagesschau_in_100_sekunden/video-1566498.html
+        const videoLinkMatch = indexHtml.match(/\/tagesschau_in_100_sekunden\/(video-|ts-)([0-9]+)\.html/);
+        
+        if (!videoLinkMatch) {
+            throw new Error("Konnte keinen Video-Link auf der Übersichtsseite finden.");
         }
         
-        const directMp4Url = enclosureMatch[1];
-        // Erzeuge eine eindeutige ID aus dem Dateinamen oder Pfad
-        const videoIdMatch = directMp4Url.match(/TV-([0-9-]+-[0-9]+)/);
-        const videoId = videoIdMatch ? videoIdMatch[1] : `ts100-${Date.now()}`;
-        
-        console.log(`Aktuellste Folge gefunden: ${videoId} (${directMp4Url})`);
+        const videoPageUrl = `https://www.tagesschau.de${videoLinkMatch[0]}`;
+        const videoId = videoLinkMatch[2];
+        console.log(`Neueste Folge: ${videoPageUrl} (ID: ${videoId})`);
 
         // 2. Prüfen, ob bereits verarbeitet
         const alreadyProcessed = await kv.sismember('processed_videos', videoId);
@@ -51,17 +42,34 @@ export default async function handler(req, res) {
             return res.status(200).json({ message: 'Folge bereits verarbeitet.', videoId });
         }
 
-        // 3. Download (schnell, da nur wenige MB)
-        console.log("Download läuft...");
+        // 3. MP4 URL aus der Video-Seite extrahieren
+        const videoPageRes = await fetch(videoPageUrl);
+        const videoPageHtml = await videoPageRes.text();
+        
+        // Suche nach MP4 Links (meistens in einem JSON-Block für den Player)
+        // Wir nehmen den ersten .mp4 Link, der nach einer hohen Qualität aussieht (z.B. webxl)
+        const mp4Matches = videoPageHtml.match(/https?:\/\/[^"']+\.mp4/g);
+        if (!mp4Matches) {
+            throw new Error("Konnte keine MP4-URL im Quelltext finden.");
+        }
+        
+        // Filter nach "webxl" oder "webl" für gute Qualität, sonst nimm den ersten
+        const directMp4Url = mp4Matches.find(m => m.includes('webxl')) || 
+                             mp4Matches.find(m => m.includes('webl')) || 
+                             mp4Matches[0];
+        
+        console.log(`Extrahiere MP4: ${directMp4Url}`);
+
+        // 4. Download (nur im /tmp Verzeichnis erlaubt auf Vercel)
         const tmpPath = path.join(os.tmpdir(), `${videoId}.mp4`);
         const mp4Res = await fetch(directMp4Url);
-        if (!mp4Res.ok) throw new Error("Download fehlgeschlagen.");
+        if (!mp4Res.ok) throw new Error("Video-Download fehlgeschlagen.");
         
         const fileStream = fs.createWriteStream(tmpPath);
         await pipeline(Readable.fromWeb(mp4Res.body), fileStream);
 
-        // 4. Gemini Upload & Analyse
-        console.log("Lade zu Gemini hoch...");
+        // 5. Gemini Upload & Analyse
+        console.log("Upload zu Gemini...");
         const uploadResult = await fileManager.uploadFile(tmpPath, {
            mimeType: 'video/mp4',
            displayName: `TS 100s ${videoId}`
@@ -73,16 +81,15 @@ export default async function handler(req, res) {
             file = await fileManager.getFile(uploadResult.file.name);
         }
 
-        if (file.state === 'FAILED') throw new Error("Gemini Processing fehlgeschlagen.");
+        if (file.state === 'FAILED') throw new Error("Gemini Video-Processing fehlgeschlagen.");
 
-        console.log("Analysiere mit Gemini 1.5 Flash...");
         const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
         const prompt = `Analysiere diese Ausgabe der "Tagesschau in 100 Sekunden". 
-Erstelle eine strukturierte Zusammenfassung und eine visuelle Beschreibung.
+Erstelle eine inhaltliche Zusammenfassung und eine visuelle Beschreibung der wichtigsten Bilder.
 Antworte ausschließlich im JSON Format:
 {
-  "summary": "Inhaltliche Zusammenfassung...",
-  "visuals": "Visuelle Details..."
+  "summary": "Text...",
+  "visuals": "Text..."
 }`;
 
         const result = await model.generateContent([
@@ -94,7 +101,7 @@ Antworte ausschließlich im JSON Format:
         const cleanedJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
         const jsonResponse = JSON.parse(cleanedJson);
 
-        // 5. In KV speichern
+        // 6. Speichern
         const dbEntry = {
             id: videoId,
             title: `Tagesschau in 100 Sekunden (${videoId})`,
@@ -108,23 +115,20 @@ Antworte ausschließlich im JSON Format:
         await kv.lpush('feed', dbEntry);
         await kv.sadd('processed_videos', videoId);
 
-        // 6. Resend E-Mail abschicken
-        console.log("Sende E-Mail...");
+        // 7. E-Mail
         await resend.emails.send({
             from: process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev',
             to: process.env.USER_EMAIL || 'onboarding@resend.dev',
-            subject: `TS 100s Update: ${videoId}`,
-            html: `<h3>Zusammenfassung</h3><p>${jsonResponse.summary}</p><h3>Visuelle Details</h3><p>${jsonResponse.visuals}</p>`
+            subject: `Newsletter: Tagesschau kompakt (${videoId})`,
+            html: `<h2>Highlights</h2><p>${jsonResponse.summary}</p><h2>Bilder des Tages</h2><p>${jsonResponse.visuals}</p>`
         });
 
-        // 7. Lokal aufräumen
         if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
         
-        console.log("Erfolgreich abgeschlossen!");
         return res.status(200).json({ success: true, videoId });
 
     } catch (error) {
-        console.error("KRITISCHER FEHLER:", error);
+        console.error("FEHLER:", error);
         return res.status(500).json({ error: 'Internal Server Error', details: String(error) });
     }
 }
