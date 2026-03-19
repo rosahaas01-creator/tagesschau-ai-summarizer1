@@ -1,0 +1,15 @@
+{
+  "crons": [
+    {
+      "path": "/api/check-video",
+      "schedule": "45 19 * * *"
+    },
+    {
+      "path": "/api/check-video",
+      "schedule": "15 20 * * *"
+    }
+  ],
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" }
+  ]
+}
