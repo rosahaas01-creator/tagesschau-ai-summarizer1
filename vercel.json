@@ -2,11 +2,7 @@
   "crons": [
     {
       "path": "/api/check-video",
-      "schedule": "45 19 * * *"
-    },
-    {
-      "path": "/api/check-video",
-      "schedule": "15 20 * * *"
+      "schedule": "0 */3 * * *"
     }
   ],
   "rewrites": [
