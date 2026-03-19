@@ -1,6 +1,4 @@
 import { kv } from '@vercel/kv';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import { GoogleAIFileManager } from '@google/generative-ai/server';
 import { Resend } from 'resend';
 import fs from 'fs';
 import { pipeline } from 'stream/promises';
@@ -10,16 +8,13 @@ import path from 'path';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// Wir behalten den SDK-Manager für den Upload (der funktioniert)
-const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
-
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
         return res.status(405).json({ error: 'Method Not Allowed' });
     }
 
     try {
-        console.log("Starte Überprüfung auf 'Tagesschau in 100 Sekunden'...");
+        console.log("Starte Überprüfung auf 'Tagesschau in 100 Sekunden' (Groq Edition)...");
         
         // 1. Suche nach Video
         const baseUrl = "https://www.tagesschau.de/multimedia/sendung/tagesschau_in_100_sekunden/";
@@ -44,7 +39,7 @@ export default async function handler(req, res) {
         
         const directMp4Url = mp4Matches.find(m => m.includes('webxl')) || mp4Matches[0];
 
-        // 2. Download
+        // 2. Download (Groq Whisper kann MP4 direkt verarbeiten bis 25MB)
         const tmpPath = path.join(os.tmpdir(), `${videoId}.mp4`);
         const mp4Res = await fetch(directMp4Url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         if (!mp4Res.ok) throw new Error("Download fehlgeschlagen.");
@@ -52,70 +47,59 @@ export default async function handler(req, res) {
         const fileStream = fs.createWriteStream(tmpPath);
         await pipeline(Readable.fromWeb(mp4Res.body), fileStream);
 
-        // 3. Gemini Upload via SDK
-        console.log("Upload zu Google...");
-        const uploadResult = await fileManager.uploadFile(tmpPath, {
-           mimeType: 'video/mp4',
-           displayName: `TS100s_${videoId}`
+        // 3. Transcription via Groq Whisper
+        console.log("Transkription via Groq Whisper...");
+        const formData = new FormData();
+        formData.append('file', new Blob([fs.readFileSync(tmpPath)]), `${videoId}.mp4`);
+        formData.append('model', 'whisper-large-v3');
+        formData.append('language', 'de');
+        formData.append('response_format', 'text');
+
+        const transRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}` },
+            body: formData
         });
 
-        let file = await fileManager.getFile(uploadResult.file.name);
-        while (file.state === 'PROCESSING') {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-            file = await fileManager.getFile(uploadResult.file.name);
+        if (!transRes.ok) {
+            const err = await transRes.text();
+            throw new Error(`Groq Transcription Error: ${err}`);
         }
+        const transcript = await transRes.text();
+        console.log("Transkription erfolgreich.");
 
-        // 4. Modell-Auto-Discovery (REST v1)
-        console.log("Suche verfügbares Modell...");
-        const modelList = await modelListDiscovery(process.env.GEMINI_API_KEY);
-        let targetModel = modelList.find(m => m.includes('gemini-1.5-flash')) || 
-                           modelList.find(m => m.includes('gemini-1.5-pro')) || 
-                           "gemini-1.5-flash"; 
-        
-        console.log(`Nutze Modell: ${targetModel}`);
-
-        // 5. Analyse via REST API v1 (WICHTIG: Snake Case verwenden für REST)
-        console.log("Analyse via REST gestartet...");
-        const generateUrl = `https://generativelanguage.googleapis.com/v1/models/${targetModel}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-        const generateRes = await fetch(generateUrl, {
+        // 4. Summarization via Groq Llama-3
+        console.log("Zusammenfassung via Groq Llama-3...");
+        const chatRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
-                contents: [{
-                    parts: [
-                        { 
-                            file_data: { 
-                                mime_type: file.mimeType, 
-                                file_uri: file.uri 
-                            } 
-                        },
-                        { text: "Fasse diese Tagesschau in 100 Sekunden kurz zusammen und beschreibe die Bilder. Antworte als JSON: { \"summary\": \"...\", \"visuals\": \"...\" }" }
-                    ]
-                }]
+                model: "llama-3.3-70b-versatile",
+                messages: [
+                    { role: "system", content: "Du bist ein Nachrichten-Assistent. Fasse den Text kurz und prägnant zusammen. Antworte NUR im JSON-Format: { \"summary\": \"...\", \"details\": \"...\" }" },
+                    { role: "user", content: `Fasse diese Tagesschau-Sendung zusammen: ${transcript}` }
+                ],
+                response_format: { type: "json_object" }
             })
         });
 
-        if (!generateRes.ok) {
-            const errBody = await generateRes.text();
-            throw new Error(`Gemini API Error (${generateRes.status}): ${errBody}`);
+        if (!chatRes.ok) {
+            const err = await chatRes.text();
+            throw new Error(`Groq Chat Error: ${err}`);
         }
+        const chatData = await chatRes.json();
+        const jsonResponse = JSON.parse(chatData.choices[0].message.content);
 
-        const genData = await generateRes.json();
-        if (!genData.candidates || !genData.candidates[0].content) {
-            throw new Error("Keine Antwort von Gemini erhalten (Blockiert oder Fehler).");
-        }
-
-        const responseText = genData.candidates[0].content.parts[0].text;
-        const cleanedJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
-        const jsonResponse = JSON.parse(cleanedJson);
-
-        // 6. Datensatz speichern
+        // 5. Datensatz speichern
         const dbEntry = {
             id: videoId,
             title: `Tagesschau in 100 Sekunden (${videoId})`,
             date: new Date().toISOString(),
             summary: jsonResponse.summary,
-            visuals: jsonResponse.visuals,
+            visuals: jsonResponse.details, // Wir mappen "details" auf "visuals" fürs Frontend
             processedAt: new Date().toISOString()
         };
 
@@ -127,28 +111,15 @@ export default async function handler(req, res) {
         await resend.emails.send({
             from: process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev',
             to: process.env.USER_EMAIL || 'onboarding@resend.dev',
-            subject: `Newsletter: Tagesschau kompakt (${videoId})`,
-            html: `<b>Zusammenfassung:</b><p>${jsonResponse.summary}</p><br><b>Bilder des Tages:</b><p>${jsonResponse.visuals}</p>`
+            subject: `Tagesschau Kompakt (via Groq) - ${videoId}`,
+            html: `<h3>Zusammenfassung</h3><p>${jsonResponse.summary}</p><h3>Details</h3><p>${jsonResponse.details}</p>`
         });
 
         if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-        return res.status(200).json({ success: true, videoId, modelUsed: targetModel });
+        return res.status(200).json({ success: true, videoId, method: 'Groq/Whisper' });
 
     } catch (error) {
         console.error("FEHLER:", error);
         return res.status(500).json({ error: 'Internal Server Error', details: String(error) });
     }
-}
-
-async function modelListDiscovery(apiKey) {
-    try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${apiKey}`);
-        const data = await res.json();
-        if (data.models) {
-            return data.models.map(m => m.name.replace('models/', ''));
-        }
-    } catch (e) {
-        console.error("Discovery failed", e);
-    }
-    return [];
 }
