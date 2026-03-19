@@ -12,8 +12,8 @@
 <body class="bg-slate-50 text-slate-900">
     <div class="max-w-3xl mx-auto py-12 px-4">
         <header class="mb-10 text-center">
-            <h1 class="text-4xl font-extrabold tracking-tight text-blue-900 mb-2">Tagesschau in 20 Sekunden</h1>
-            <p class="text-slate-500">Automatische KI-Zusammenfassungen der 20 Uhr Ausgaben</p>
+            <h1 class="text-4xl font-extrabold tracking-tight text-blue-900 mb-2">Tagesschau in 100 Sekunden</h1>
+            <p class="text-slate-500">Automatische KI-Zusammenfassungen der kompakten Nachrichtensendung</p>
         </header>
 
         <main id="feed" class="space-y-8">
@@ -75,7 +75,7 @@
                         </div>
                         <div class="bg-slate-50 px-6 py-3 border-t border-slate-100 text-xs text-slate-400 flex justify-between">
                             <span>Analysiert am ${new Date(item.processedAt).toLocaleString('de-DE')}</span>
-                            <a href="https://youtube.com/watch?v=${item.id}" target="_blank" class="hover:text-blue-600 transition-colors">Video auf YouTube ansehen &rarr;</a>
+                            <a href="https://www.tagesschau.de/tagesschau_in_100_sekunden/video-${item.id}.html" target="_blank" class="hover:text-blue-600 transition-colors">Video auf tagesschau.de ansehen &rarr;</a>
                         </div>
                     `;
                     feedContainer.appendChild(card);
