@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tagesschau Summarizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+    <div class="max-w-3xl mx-auto py-12 px-4">
+        <header class="mb-10 text-center">
+            <h1 class="text-4xl font-extrabold tracking-tight text-blue-900 mb-2">Tagesschau in 100 Sekunden</h1>
+            <p class="text-slate-500">Automatische KI-Zusammenfassungen der kompakten Nachrichtensendung</p>
+        </header>
+
+        <main id="feed" class="space-y-8">
+            <div class="text-center text-slate-400 py-10">
+                <svg class="animate-spin h-8 w-8 mx-auto mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Lade aktuellste Sendungen...
+            </div>
+        </main>
+    </div>
+
+    <script>
+        async function loadFeed() {
+            try {
+                const res = await fetch('/api/feed');
+                const data = await res.json();
+                const feedContainer = document.getElementById('feed');
+                
+                if (!data || data.length === 0) {
+                    feedContainer.innerHTML = '<p class="text-center text-slate-500 py-10">Noch keine Zusammenfassungen vorhanden. Das nächste Video wird bald analysiert!</p>';
+                    return;
+                }
+                
+                // Clear loading spinner
+                feedContainer.innerHTML = '';
+                
+                // Render items
+                data.forEach(item => {
+                    // Datum formatieren
+                    const dateObj = new Date(item.date);
+                    const dateStr = dateObj.toLocaleDateString('de-DE', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+                    
+                    const card = document.createElement('article');
+                    card.className = "bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden hover:shadow-md transition-shadow";
+                    
+                    card.innerHTML = `
+                        <div class="px-6 py-5 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                            <h2 class="text-xl font-bold text-slate-800">${item.title}</h2>
+                            <span class="text-sm font-medium text-slate-500 bg-white px-3 py-1 rounded-full shadow-sm">${dateStr}</span>
+                        </div>
+                        <div class="p-6">
+                            <h3 class="text-sm font-semibold text-blue-600 uppercase tracking-wider mb-3 flex items-center">
+                                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"></path></svg>
+                                Inhaltliche Zusammenfassung
+                            </h3>
+                            <div class="prose prose-slate max-w-none mb-8 text-slate-700 leading-relaxed font-serif">
+                                ${(item.summary || '').replace(/\n/g, '<br>')}
+                            </div>
+                            
+                            <h3 class="text-sm font-semibold text-purple-600 uppercase tracking-wider mb-3 flex items-center">
+                                <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
+                                Details / Hintergrund
+                            </h3>
+                            <div class="bg-indigo-50 rounded-lg p-4 text-sm text-indigo-900 border border-indigo-100">
+                                ${(item.visuals || 'Keine weiteren Details verfügbar.').replace(/\n/g, '<br>')}
+                            </div>
+                        </div>
+                        <div class="bg-slate-50 px-6 py-3 border-t border-slate-100 text-xs text-slate-400 flex justify-between">
+                            <span>Analysiert am ${new Date(item.processedAt).toLocaleString('de-DE')}</span>
+                            <a href="https://www.tagesschau.de/tagesschau_in_100_sekunden/video-${item.id}.html" target="_blank" class="hover:text-blue-600 transition-colors">Video auf tagesschau.de ansehen &rarr;</a>
+                        </div>
+                    `;
+                    feedContainer.appendChild(card);
+                });
+            } catch (error) {
+                console.error("Fehler beim Laden:", error);
+                document.getElementById('feed').innerHTML = `
+                    <div class="bg-red-50 text-red-500 p-4 rounded-lg text-center">
+                        <strong>Fehler beim Laden:</strong><br>
+                        ${error.message}<br>
+                        <small class="text-xs">Tipp: Stelle sicher, dass du nach dem Verbinden der DB auf Vercel "Redeploy" geklickt hast!</small>
+                    </div>`;
+            }
+        }
+        
+        loadFeed();
+    </script>
+</body>
+</html>
