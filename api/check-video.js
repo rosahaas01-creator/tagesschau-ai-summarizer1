@@ -1,5 +1,6 @@
 import { kv } from '@vercel/kv';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleAIFileManager } from '@google/generative-ai/server';
 import { Resend } from 'resend';
 import ytdl from '@distube/ytdl-core';
 import fs from 'fs';
@@ -9,7 +10,8 @@ import path from 'path';
 
 // Initialisiere die APIs
 const resend = new Resend(process.env.RESEND_API_KEY);
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 
 export default async function handler(req, res) {
     if (req.method !== 'GET' && req.method !== 'POST') {
@@ -19,10 +21,21 @@ export default async function handler(req, res) {
     try {
         console.log("Starte Überprüfung auf neues Tagesschau-Video...");
         
+        // Check API Keys
+        if (!process.env.GEMINI_API_KEY || !process.env.YOUTUBE_API_KEY) {
+            throw new Error("API Keys fehlen in den Environment Variables.");
+        }
+
         // 1. YouTube Playlist abrufen
         const PLAYLIST_ID = 'PL4A2F331EE86DCC22';
         const ytUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${PLAYLIST_ID}&maxResults=3&key=${process.env.YOUTUBE_API_KEY}`;
+        
         const ytRes = await fetch(ytUrl);
+        if (!ytRes.ok) {
+            const errorText = await ytRes.text();
+            throw new Error(`YouTube API Fehler (${ytRes.status}): ${errorText}`);
+        }
+        
         const ytData = await ytRes.json();
         
         if (!ytData.items || ytData.items.length === 0) {
@@ -55,24 +68,28 @@ export default async function handler(req, res) {
         
         // 4. Video an Gemini File API hochladen
         console.log("Lade Video zu Gemini hoch...");
-        const uploadResult = await ai.files.upload({
-           file: tmpPath,
-           mimeType: 'video/mp4'
+        const uploadResult = await fileManager.uploadFile(tmpPath, {
+           mimeType: 'video/mp4',
+           displayName: videoTitle
         });
         
-        console.log("Warte auf Gemini Video-Processing...");
-        let fileInfo = await ai.files.get({name: uploadResult.name});
-        while (fileInfo.state === 'PROCESSING') {
-            await new Promise(r => setTimeout(r, 5000));
-            fileInfo = await ai.files.get({name: uploadResult.name});
+        console.log(`Video hochgeladen: ${uploadResult.file.uri}`);
+
+        // Warte auf Processing
+        let file = await fileManager.getFile(uploadResult.file.name);
+        while (file.state === 'PROCESSING') {
+            process.stdout.write(".");
+            await new Promise((resolve) => setTimeout(resolve, 10_000));
+            file = await fileManager.getFile(uploadResult.file.name);
         }
-        
-        if (fileInfo.state === 'FAILED') {
-            throw new Error("Gemini Video-Processing ist fehlgeschlagen.");
+
+        if (file.state === 'FAILED') {
+            throw new Error("Video processing failed.");
         }
         
         // 5. Inhalte via Gemini generieren
-        console.log("Analysiere Video mit gemini-3.1-flash-lite-preview...");
+        console.log("Analysiere Video mit gemini-1.5-flash...");
+        const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
         const prompt = `Du bist ein professioneller Nachrichten-Analyst. 
 Analysiere diese Ausgabe der "Tagesschau 20 Uhr".
 Erstelle mir eine Ausgabe im JSON Format mit folgendem Schema:
@@ -81,18 +98,20 @@ Erstelle mir eine Ausgabe im JSON Format mit folgendem Schema:
   "visuals": "Detaillierte visuelle Beschreibung (Szenen, Grafiken im Hintergrund, Auffälligkeiten im Studio)."
 }`;
 
-        const response = await ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite-preview',
-            contents: [
-                uploadResult,
-                { text: prompt }
-            ],
-            config: {
-                responseMimeType: "application/json"
-            }
-        });
+        const result = await model.generateContent([
+            {
+                fileData: {
+                    mimeType: file.mimeType,
+                    fileUri: file.uri
+                }
+            },
+            { text: prompt },
+        ]);
         
-        const jsonResponse = JSON.parse(response.text);
+        const responseText = result.response.text();
+        // Bereinige den Text von Markdown-Code-Blöcken falls vorhanden
+        const cleanedJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+        const jsonResponse = JSON.parse(cleanedJson);
         
         // 6. In Vercel KV Datenbank speichern
         console.log("Speichere in Datenbank...");
@@ -123,9 +142,10 @@ Erstelle mir eine Ausgabe im JSON Format mit folgendem Schema:
             html: `<h2>Zusammenfassung</h2><p>${jsonResponse.summary.replace(/\n/g, '<br>')}</p><h2>Visuelle Details</h2><p>${jsonResponse.visuals.replace(/\n/g, '<br>')}</p>`
         });
         
-        // 8. Aufräumen (Lokale Datei und Gemini File löschen um Platz zu sparen)
-        fs.unlinkSync(tmpPath);
-        await ai.files.delete({name: uploadResult.name});
+        // 8. Aufräumen (Lokale Datei löschen, Vercel löscht /tmp eh irgendwann, aber sicher ist sicher)
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        // Hinweis: Die Datei bei Google AI Studio bleibt dort, falls man sie später braucht, 
+        // oder man könnte sie mit fileManager.deleteFile(file.name) löschen.
         
         console.log("Erfolgreich abgeschlossen!");
         return res.status(200).json({ success: true, dbEntry });
