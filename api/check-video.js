@@ -9,7 +9,8 @@ import os from 'os';
 import path from 'path';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
-const ai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Wir behalten den SDK-Manager für den Upload (der funktioniert)
 const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
 
 export default async function handler(req, res) {
@@ -51,7 +52,7 @@ export default async function handler(req, res) {
         const fileStream = fs.createWriteStream(tmpPath);
         await pipeline(Readable.fromWeb(mp4Res.body), fileStream);
 
-        // 3. Gemini Upload via SDK (Das funktioniert meistens stabil)
+        // 3. Gemini Upload via SDK
         console.log("Upload zu Google...");
         const uploadResult = await fileManager.uploadFile(tmpPath, {
            mimeType: 'video/mp4',
@@ -64,7 +65,7 @@ export default async function handler(req, res) {
             file = await fileManager.getFile(uploadResult.file.name);
         }
 
-        // 4. Modell-Auto-Discovery (Wir suchen live nach dem richtigen Modell-Namen)
+        // 4. Modell-Auto-Discovery (REST v1)
         console.log("Suche verfügbares Modell...");
         const modelList = await modelListDiscovery(process.env.GEMINI_API_KEY);
         let targetModel = modelList.find(m => m.includes('gemini-1.5-flash')) || 
@@ -73,8 +74,8 @@ export default async function handler(req, res) {
         
         console.log(`Nutze Modell: ${targetModel}`);
 
-        // 5. Analyse via REST API v1 (WICHTIG: v1 statt v1beta nutzen um 404 zu vermeiden)
-        console.log("Starte Analyse via REST v1...");
+        // 5. Analyse via REST API v1 (WICHTIG: Snake Case verwenden für REST)
+        console.log("Analyse via REST gestartet...");
         const generateUrl = `https://generativelanguage.googleapis.com/v1/models/${targetModel}:generateContent?key=${process.env.GEMINI_API_KEY}`;
         const generateRes = await fetch(generateUrl, {
             method: 'POST',
@@ -82,7 +83,12 @@ export default async function handler(req, res) {
             body: JSON.stringify({
                 contents: [{
                     parts: [
-                        { fileData: { mimeType: file.mimeType, fileUri: file.uri } },
+                        { 
+                            file_data: { 
+                                mime_type: file.mimeType, 
+                                file_uri: file.uri 
+                            } 
+                        },
                         { text: "Fasse diese Tagesschau in 100 Sekunden kurz zusammen und beschreibe die Bilder. Antworte als JSON: { \"summary\": \"...\", \"visuals\": \"...\" }" }
                     ]
                 }]
@@ -95,6 +101,10 @@ export default async function handler(req, res) {
         }
 
         const genData = await generateRes.json();
+        if (!genData.candidates || !genData.candidates[0].content) {
+            throw new Error("Keine Antwort von Gemini erhalten (Blockiert oder Fehler).");
+        }
+
         const responseText = genData.candidates[0].content.parts[0].text;
         const cleanedJson = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
         const jsonResponse = JSON.parse(cleanedJson);
@@ -113,6 +123,7 @@ export default async function handler(req, res) {
         await kv.lpush('feed', dbEntry);
         await kv.sadd('processed_videos', videoId);
 
+        // E-Mail senden
         await resend.emails.send({
             from: process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev',
             to: process.env.USER_EMAIL || 'onboarding@resend.dev',
@@ -131,7 +142,6 @@ export default async function handler(req, res) {
 
 async function modelListDiscovery(apiKey) {
     try {
-        // Wir versuchen v1 UND v1beta bei der Discovery
         const res = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${apiKey}`);
         const data = await res.json();
         if (data.models) {
