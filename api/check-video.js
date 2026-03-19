@@ -14,43 +14,40 @@ export default async function handler(req, res) {
     }
 
     try {
-        console.log("Starte Überprüfung auf 'Tagesschau in 100 Sekunden' (Groq Edition)...");
+        console.log("Starte Überprüfung auf 'Tagesschau in 100 Sekunden' (Audio Edition)...");
         
-        // 1. Suche nach Video
-        const baseUrl = "https://www.tagesschau.de/multimedia/sendung/tagesschau_in_100_sekunden/";
-        const indexRes = await fetch(baseUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const indexHtml = await indexRes.text();
+        // 1. Suche nach der neuesten AUDIO-Folge (Viel kleiner als Video, perfekt für Groq)
+        // Wir nutzen den Podcast-RSS-Feed, da er stabil die MP3-Links liefert
+        const rssUrl = "https://www.tagesschau.de/infoservices/podcast/tagesschau_100_sekunden/index~podcast.xml";
+        const rssRes = await fetch(rssUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const rssXml = await rssRes.text();
         
-        const videoLinkMatch = indexHtml.match(/\/tagesschau_in_100_sekunden\/(video-|ts-)([0-9]+)\.html/);
-        if (!videoLinkMatch) throw new Error("Kein Video-Link gefunden.");
+        // Extrahiere den ersten MP3-Link und die ID (meistens im <guid> oder <link>)
+        const mp3Match = rssXml.match(/<enclosure url="(https?:[^"]+\.mp3)"/);
+        const guidMatch = rssXml.match(/<guid[^>]*>(https?:[^<]+)<\/guid>/) || rssXml.match(/<link>(https?:[^<]+)<\/link>/);
         
-        const videoPageUrl = `https://www.tagesschau.de${videoLinkMatch[0]}`;
-        const videoId = videoLinkMatch[2];
+        if (!mp3Match) throw new Error("Keine MP3 im RSS-Feed gefunden.");
+        
+        const directMp3Url = mp3Match[1];
+        // Wir extrahieren eine ID aus der URL oder dem GUID
+        const videoId = directMp3Url.split('/').pop().replace('.mp3', '').substring(0, 20);
 
         const alreadyProcessed = await kv.sismember('processed_videos', videoId);
         if (alreadyProcessed) return res.status(200).json({ message: 'Schon erledigt.', videoId });
 
-        const detailRes = await fetch(videoPageUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const detailHtml = await detailRes.text();
-        
-        const mp4Regex = /https?:\/\/[^"'>\s&]+?\.mp4(?:[^"'>\s&]*)/g;
-        let mp4Matches = (detailHtml.match(mp4Regex) || []).map(url => url.replace(/\\/g, '').split('&')[0]);
-        if (mp4Matches.length === 0) throw new Error("Kein MP4 gefunden.");
-        
-        const directMp4Url = mp4Matches.find(m => m.includes('webxl')) || mp4Matches[0];
-
-        // 2. Download (Groq Whisper kann MP4 direkt verarbeiten bis 25MB)
-        const tmpPath = path.join(os.tmpdir(), `${videoId}.mp4`);
-        const mp4Res = await fetch(directMp4Url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (!mp4Res.ok) throw new Error("Download fehlgeschlagen.");
+        // 2. Download MP3 (Nur ca. 1-2 MB)
+        const tmpPath = path.join(os.tmpdir(), `${videoId}.mp3`);
+        const mp3Res = await fetch(directMp3Url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (!mp3Res.ok) throw new Error("Download fehlgeschlagen.");
         
         const fileStream = fs.createWriteStream(tmpPath);
-        await pipeline(Readable.fromWeb(mp4Res.body), fileStream);
+        await pipeline(Readable.fromWeb(mp3Res.body), fileStream);
+        console.log(`Download von ${directMp3Url} abgeschlossen.`);
 
         // 3. Transcription via Groq Whisper
         console.log("Transkription via Groq Whisper...");
         const formData = new FormData();
-        formData.append('file', new Blob([fs.readFileSync(tmpPath)]), `${videoId}.mp4`);
+        formData.append('file', new Blob([fs.readFileSync(tmpPath)]), `${videoId}.mp3`);
         formData.append('model', 'whisper-large-v3');
         formData.append('language', 'de');
         formData.append('response_format', 'text');
@@ -79,8 +76,8 @@ export default async function handler(req, res) {
             body: JSON.stringify({
                 model: "llama-3.3-70b-versatile",
                 messages: [
-                    { role: "system", content: "Du bist ein Nachrichten-Assistent. Fasse den Text kurz und prägnant zusammen. Antworte NUR im JSON-Format: { \"summary\": \"...\", \"details\": \"...\" }" },
-                    { role: "user", content: `Fasse diese Tagesschau-Sendung zusammen: ${transcript}` }
+                    { role: "system", content: "Du bist ein Nachrichten-Assistent. Fasse die Nachrichtensendung kurz zusammen. Antworte NUR im JSON-Format: { \"summary\": \"...\", \"details\": \"...\" }" },
+                    { role: "user", content: `Hier ist das Transkript: ${transcript}` }
                 ],
                 response_format: { type: "json_object" }
             })
@@ -96,10 +93,10 @@ export default async function handler(req, res) {
         // 5. Datensatz speichern
         const dbEntry = {
             id: videoId,
-            title: `Tagesschau in 100 Sekunden (${videoId})`,
+            title: `Tagesschau in 100 Sekunden (Audio)`,
             date: new Date().toISOString(),
             summary: jsonResponse.summary,
-            visuals: jsonResponse.details, // Wir mappen "details" auf "visuals" fürs Frontend
+            visuals: jsonResponse.details, 
             processedAt: new Date().toISOString()
         };
 
@@ -111,12 +108,12 @@ export default async function handler(req, res) {
         await resend.emails.send({
             from: process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev',
             to: process.env.USER_EMAIL || 'onboarding@resend.dev',
-            subject: `Tagesschau Kompakt (via Groq) - ${videoId}`,
-            html: `<h3>Zusammenfassung</h3><p>${jsonResponse.summary}</p><h3>Details</h3><p>${jsonResponse.details}</p>`
+            subject: `Tagesschau kompakt - ${new Date().toLocaleDateString('de-DE')}`,
+            html: `<h3>Zusammenfassung</h3><p>${jsonResponse.summary}</p><h3>Hintergrund</h3><p>${jsonResponse.details}</p>`
         });
 
         if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-        return res.status(200).json({ success: true, videoId, method: 'Groq/Whisper' });
+        return res.status(200).json({ success: true, videoId, method: 'Groq/Whisper-Audio' });
 
     } catch (error) {
         console.error("FEHLER:", error);
