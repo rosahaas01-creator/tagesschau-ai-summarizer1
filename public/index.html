@@ -82,7 +82,12 @@
                 });
             } catch (error) {
                 console.error("Fehler beim Laden:", error);
-                document.getElementById('feed').innerHTML = '<div class="bg-red-50 text-red-500 p-4 rounded-lg text-center">Fehler beim Laden des Feeds. Bitte später erneut versuchen.</div>';
+                document.getElementById('feed').innerHTML = `
+                    <div class="bg-red-50 text-red-500 p-4 rounded-lg text-center">
+                        <strong>Fehler beim Laden:</strong><br>
+                        ${error.message}<br>
+                        <small class="text-xs">Tipp: Stelle sicher, dass du nach dem Verbinden der DB auf Vercel "Redeploy" geklickt hast!</small>
+                    </div>`;
             }
         }
         
